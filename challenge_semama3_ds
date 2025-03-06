@@ -1,0 +1,159 @@
+// Include Libraries to be used
+#include <micro_ros_arduino.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <std_msgs/msg/float32.h>
+#include <stdio.h>
+
+// Define Macros
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){error_loop();}}
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){}}
+
+// Define GPIO pins
+#define LED_PIN 23     // LED Indicator
+#define PWM_PIN 22     // PWM Output
+#define In1 14         // Motor Driver Input 1
+#define In2 27         // Motor Driver Input 2
+
+// PWM Settings
+#define PWM_FRQ 5000   // PWM Frequency
+#define PWM_RES 8      // PWM Resolution
+#define PWM_CHNL 0     // PWM Channel
+
+// Define acceptable range for received values (-1 to 1)
+#define MSG_MIN_VAL -1 
+#define MSG_MAX_VAL 1  
+
+// Variables
+float pwm_set_point = 1.0;
+
+// Declare Micro-ROS entities
+rcl_node_t node;
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_subscription_t subscriber;
+rcl_publisher_t pwm_publisher;
+rcl_timer_t timer;
+std_msgs_msg_Float32 msg;
+
+
+// Error handling function
+void error_loop(){
+  while(1){
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Toggle LED
+    delay(100);
+  }
+}
+
+// Motor direction control functions
+void derecha() {
+  digitalWrite(In1, HIGH);
+  digitalWrite(In2, LOW);
+}
+
+void izquierda() {
+  digitalWrite(In1, LOW);
+  digitalWrite(In2, HIGH);
+}
+
+// Variable para almacenar el último valor del PWM recibido
+float prev_pwm_set_point = 1.0;
+
+void detener_motor() {
+  digitalWrite(In1, LOW);
+  digitalWrite(In2, LOW);
+  ledcWrite(PWM_CHNL, 0);  // Apagar PWM completamente
+  delay(100);  // Breve espera solo si cambia la dirección
+}
+
+void subscription_callback(const void * msgin) {  
+  const std_msgs_msgFloat32 * msg = (const std_msgsmsg_Float32 *)msgin;
+  float new_pwm_set_point = constrain(msg->data, MSG_MIN_VAL, MSG_MAX_VAL);
+
+  // Si el valor es 0.0, detener el motor
+  if (new_pwm_set_point == 0.0) {
+    detener_motor();
+    prev_pwm_set_point = 0.0;
+    return;
+  }
+
+  // Si el valor está entre -0.45 y 0.45, conservar el valor anterior
+  if (new_pwm_set_point > -0.45 && new_pwm_set_point < 0.45) {
+    new_pwm_set_point = prev_pwm_set_point;
+  }
+
+  // Si el signo ha cambiado, detener momentáneamente antes de cambiar dirección
+  if ((prev_pwm_set_point > 0 && new_pwm_set_point < 0) || 
+      (prev_pwm_set_point < 0 && new_pwm_set_point > 0)) {
+    detener_motor();
+  }
+
+  // Determinar dirección
+  if (new_pwm_set_point > 0) {
+    derecha();
+  } else if (new_pwm_set_point < 0) {
+    izquierda();
+  }
+
+  // Aplicar el nuevo PWM
+  uint32_t duty_cycle = abs(new_pwm_set_point) * (pow(2, PWM_RES) - 1);
+  ledcWrite(PWM_CHNL, duty_cycle);
+
+  // Guardar el nuevo valor como referencia para la próxima llamada
+  prev_pwm_set_point = new_pwm_set_point;
+}
+
+
+
+
+
+// Setup function
+void setup() {
+  set_microros_transports();
+
+  // Configurar pines
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(PWM_PIN, OUTPUT);
+  pinMode(In1, OUTPUT);
+  pinMode(In2, OUTPUT);
+
+  digitalWrite(LED_PIN, HIGH);
+
+  // Configurar PWM en el ESP32
+  ledcSetup(PWM_CHNL, PWM_FRQ, PWM_RES);
+  ledcAttachPin(PWM_PIN, PWM_CHNL);
+
+  // 🚀 Aplicar dirección y PWM inicial (motor hacia adelante con 100%)
+  pwm_set_point = 1.0;  // Asegurar que el valor inicial es 1.0
+  izquierda();  // Configurar la dirección inicial del motor
+  uint32_t duty_cycle = pwm_set_point * (pow(2, PWM_RES) - 1);
+  ledcWrite(PWM_CHNL, duty_cycle);  // Aplicar PWM al motor
+
+  delay(2000);  // Pequeña espera para la conexión
+
+  // Inicializar Micro-ROS
+  allocator = rcl_get_default_allocator();
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  // Crear nodo
+  RCCHECK(rclc_node_init_default(&node, "motor", "", &support));
+
+  // Crear suscriptor
+  RCCHECK(rclc_subscription_init_default(
+    &subscriber,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+    "cmd_pwm"));
+
+  // Crear ejecutor
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &msg, &subscription_callback, ON_NEW_DATA));
+}
+
+void loop() {
+  delay(100);
+  RCCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100)));
+}
